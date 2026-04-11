@@ -20,6 +20,8 @@ import {
 import {
   notifyYourTurn,
   notifySessionEnded,
+  sendNotification,
+  storeNotification,
   sendAndStoreNotification
 } from '../lib/fcm';
 import { startGracePeriod } from '../lib/grace';
@@ -82,6 +84,8 @@ export default async function handler(
       unlockDoor(machineId),
       // Clear currentUserId from RTDB iot/ so dashboard + queue update instantly
       rtdb.ref(`iot/${machineId}`).update({ currentUserId: null, state: 'Available' }),
+      // Clear clothesGrace so "Collecting clothes" label doesn't persist into the next session
+      rtdb.ref(`clothesGrace/${machineId}`).remove(),
     ]);
 
     // ── FIX #7: Write usage record to Firestore ───────────────────────────────
@@ -106,33 +110,21 @@ export default async function handler(
       ]).catch(err => console.error('[release] usageHistory write failed:', err));
     }
 
-    // Notify session ended + get next user in parallel — both are independent.
-    // Previously notifySessionEnded was awaited before getNextUser, adding ~0.2-0.5s
-    // to the critical path on every release. Now they run concurrently.
+    // ── Store notifications BEFORE responding so in-app list is always current ─
     const [nextUser] = await Promise.all([
       getNextUser(machineId),
       notifySessionEnded(userId, machineId).catch(() => {}),
-      sendAndStoreNotification({
-        userId,
-        type: 'session_ended',
-        title: '👋 Session Ended',
-        body: `Your session at Machine ${machineId} has ended.`,
-        data: { machineId },
-      }).catch(() => {}),
+      // Firestore write is awaited — in-app list updates before client sees response
+      storeNotification(userId, 'session_ended', '👋 Session Ended',
+        `Your session at Machine ${machineId} has ended.`, { machineId }),
     ]);
 
     if (nextUser) {
       await startGracePeriod(machineId, nextUser.userId, nextUser.name || 'Unknown');
-      notifyYourTurn(nextUser.userId, machineId).catch(() => {});
-      sendAndStoreNotification({
-        userId: nextUser.userId,
-        type: 'your_turn',
-        title: '🎉 Your Turn!',
-        body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
-        data: { machineId },
-        sound: 'alarm',
-        priority: 'high',
-      }).catch(() => {});
+
+      // Store your_turn notification BEFORE responding
+      await storeNotification(nextUser.userId, 'your_turn', '🎉 Your Turn!',
+        `Machine ${machineId} is ready! You have 5 minutes to scan in.`, { machineId });
 
       res.status(200).json({
         success: true,
@@ -144,12 +136,23 @@ export default async function handler(
           gracePeriodMinutes: 5,
         },
       });
+
+      // FCM pushes AFTER response — best-effort, never causes lag
+      Promise.all([
+        sendNotification({ userId, type: 'session_ended', title: '👋 Session Ended', body: `Your session at Machine ${machineId} has ended.`, data: { machineId } }),
+        notifyYourTurn(nextUser.userId, machineId),
+        sendNotification({ userId: nextUser.userId, type: 'your_turn', title: '🎉 Your Turn!', body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`, data: { machineId }, sound: 'alarm', priority: 'high' }),
+      ]).catch(() => {});
     } else {
       res.status(200).json({
         success: true,
         message: 'Session ended. Machine is now available.',
         data: { released: true, nextUserId: null, status: 'Available' },
       });
+
+      // FCM push after response
+      sendNotification({ userId, type: 'session_ended', title: '👋 Session Ended', body: `Your session at Machine ${machineId} has ended.`, data: { machineId } })
+        .catch(() => {});
     }
 
   } catch (error) {

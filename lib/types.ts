@@ -11,6 +11,25 @@ export interface GracePeriod {
   status: 'active' | 'claimed' | 'expired';
 }
 
+// ─── Clothes Collection Grace Period ──────────────────────────────────────────
+// Triggered when IoT machine sets state = 'Clothes Inside' in RTDB.
+// Lives at RTDB path:  clothesGrace/{machineId}
+// Separate from GracePeriod (which is for "your turn" scan-in flows).
+
+export interface ClothesGracePeriod {
+  machineId: string;
+  userId: string;       // the current user who needs to collect
+  userName: string;
+  startedAt: string;   // ISO
+  expiresAt: string;   // ISO  (startedAt + 5 min)
+  warningSent: boolean;
+  status: 'active' | 'collecting' | 'expired';
+  // status transitions:
+  //   'active'     → clothes inside, alarm ringing, label = "Preparing to collect"
+  //   'collecting' → user dismissed the modal, label = "Collecting clothes"
+  //   'expired'    → 5 min passed with no collection detected
+}
+
 // ─── Usage record ──────────────────────────────────────────────────────────────
 
 export interface UsageRecord {

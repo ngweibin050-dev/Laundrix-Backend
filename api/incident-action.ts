@@ -9,12 +9,17 @@
  *   dismissed     → admin closed the buzzer
  *   timeout       → 60s no owner response → Unauthorized history
  *
- * Notifications:
- *   confirm        → only intruder ("Machine in use") + owner ("Someone at your machine")
- *   thats_me       → silent, history = Interrupted
- *   confirm_not_me → admins + intruder ("Unauthorized Access Alert"), history = Unauthorized
- *   timeout        → admins notified, history = Unauthorized
- *   admin_dismiss  → stops buzzer
+ * Signal delivery (why we use incidentSignals collection):
+ *   Firestore security rules block list/query operations on `incidents` collection
+ *   for regular users. RTDB rules may also block client reads of userIncident/.
+ *   
+ *   FIX: write to `incidentSignals/{userId}` — a DIRECT document read (not a query).
+ *   Security rule is simply: allow read: if request.auth.uid == userId
+ *   No list/query needed → no security rule complexity.
+ *
+ *   incidentSignals/{ownerUserId}  → written on confirm   (owner sees modal)
+ *   incidentSignals/{adminUserId}  → written on report    (admin sees modal, one doc per admin)
+ *   Both are deleted when incident resolves/dismisses/times out.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -68,12 +73,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse): 
         break;
 
       case 'admin_dismiss':
-        await handleAdminDismiss(incidentId, incident, true);
+        await handleAdminDismiss(incidentId, incident, userId, true);
         res.status(200).json({ success: true, message: 'Buzzer dismissed.', data: { status: 'dismissed' } });
         break;
 
       case 'admin_dismiss_false':
-        await handleAdminDismiss(incidentId, incident, false);
+        await handleAdminDismiss(incidentId, incident, userId, false);
         res.status(200).json({ success: true, message: 'False alarm dismissed.', data: { status: 'dismissed' } });
         break;
 
@@ -95,73 +100,114 @@ function getOwnerUserId(incident: any): string {
   return incident.ownerUserId || incident.nextUserId;
 }
 
-// Step 1: intruder confirmed → owner_pending
-// Writes RTDB userIncident/{ownerUserId} so owner's device picks it up instantly
-// (Firestore security rules may block list queries by ownerUserId field)
+// ── incidentSignals helpers ────────────────────────────────────────────────────
+// Direct Firestore document write — readable by client as doc(db,'incidentSignals',userId)
+// No query needed → no security rule complexity.
+
+async function writeOwnerSignal(ownerUserId: string, incidentId: string, incident: any, newExpiresAt: string): Promise<void> {
+  await db.collection('incidentSignals').doc(ownerUserId).set({
+    incidentId,
+    machineId:     incident.machineId,
+    intruderName:  incident.intruderName  ?? 'Unknown',
+    intruderId:    incident.intruderId    ?? '',
+    ownerUserId,
+    ownerUserName: incident.ownerUserName ?? incident.nextUserName ?? 'Unknown',
+    createdAt:     incident.createdAt,
+    expiresAt:     newExpiresAt,
+    status:        'owner_pending',
+    updatedAt:     new Date().toISOString(),
+  });
+}
+
+async function writeAdminSignal(adminUserId: string, incidentId: string, incident: any, expiresAt: string): Promise<void> {
+  await db.collection('incidentSignals').doc(adminUserId).set({
+    incidentId,
+    machineId:     incident.machineId,
+    intruderName:  incident.intruderName  ?? 'Unknown',
+    intruderId:    incident.intruderId    ?? '',
+    ownerUserId:   getOwnerUserId(incident),
+    ownerUserName: incident.ownerUserName ?? incident.nextUserName ?? 'Unknown',
+    createdAt:     incident.createdAt,
+    expiresAt,
+    status:        'admin_pending',
+    updatedAt:     new Date().toISOString(),
+  });
+}
+
+async function clearSignal(userId: string): Promise<void> {
+  await db.collection('incidentSignals').doc(userId).delete().catch(() => {});
+}
+
+// ── Step 1: intruder confirmed → owner_pending ────────────────────────────────
 async function handleConfirm(incidentId: string, incident: any, userId: string): Promise<void> {
   const ownerUserId = getOwnerUserId(incident);
   const now = new Date().toISOString();
   const newExpiresAt = new Date(Date.now() + 60 * 1000).toISOString();
 
-  // Update Firestore status
+  // 1. Update Firestore incident status
   await incidentsRef.doc(incidentId).update({
-    status: 'owner_pending',
+    status:      'owner_pending',
     confirmedAt: now,
     confirmedBy: userId,
-    expiresAt: newExpiresAt,
+    expiresAt:   newExpiresAt,
   });
 
-  // ── KEY FIX: write RTDB signal directly to owner's node ──────────────────
-  // Firestore query-by-field may be blocked by security rules for the owner.
-  // RTDB userIncident/{uid} is readable by that user only — reliable delivery.
-  await rtdb.ref(`userIncident/${ownerUserId}`).set({
+  // 2. Write to incidentSignals/{ownerUserId} — primary signal, guaranteed readable by owner
+  //    (direct doc read, no query, no security rule complexity)
+  await writeOwnerSignal(ownerUserId, incidentId, incident, newExpiresAt);
+
+  // 3. Also write RTDB as backup (works if RTDB rules are set up correctly)
+  rtdb.ref(`userIncident/${ownerUserId}`).set({
     incidentId,
     machineId:     incident.machineId,
     intruderName:  incident.intruderName,
     intruderId:    incident.intruderId,
     ownerUserId,
-    ownerUserName: incident.ownerUserName || incident.nextUserName || 'Unknown',
+    ownerUserName: incident.ownerUserName ?? incident.nextUserName ?? 'Unknown',
     createdAt:     incident.createdAt,
     expiresAt:     newExpiresAt,
     status:        'owner_pending',
-  });
+  }).catch((e) => console.warn('[incident-action] RTDB owner write failed (non-critical):', e?.message));
 
   await Promise.allSettled([
     sendAndStoreNotification({
-      userId: incident.intruderId,
-      type: 'unauthorized_warning',
-      title: '⚠️ Machine In Use',
-      body: `Machine ${incident.machineId} is in use. Your access has been reported to the owner.`,
-      data: { machineId: incident.machineId, incidentId, type: 'incident_intruder' },
+      userId:   incident.intruderId,
+      type:     'unauthorized_warning',
+      title:    '⚠️ Machine In Use',
+      body:     `Machine ${incident.machineId} is in use. Your access has been reported to the owner.`,
+      data:     { machineId: incident.machineId, incidentId, type: 'incident_intruder' },
       priority: 'high',
     }),
     sendAndStoreNotification({
-      userId: ownerUserId,
-      type: 'unauthorized_alert',
-      title: '🚨 Someone Is Using Your Machine!',
-      body: `${incident.intruderName} is using Machine ${incident.machineId}. Tap to respond.`,
-      data: { machineId: incident.machineId, incidentId, type: 'incident_owner' },
+      userId:   ownerUserId,
+      type:     'unauthorized_alert',
+      title:    '🚨 Someone Is Using Your Machine!',
+      body:     `${incident.intruderName} is using Machine ${incident.machineId}. Tap to respond.`,
+      data:     { machineId: incident.machineId, incidentId, type: 'incident_owner' },
       priority: 'high',
     }),
   ]);
 }
 
-// Step 2a: owner "Yes It's Me" → resolved, history = Interrupted
+// ── Step 2a: owner "Yes It's Me" → resolved ────────────────────────────────────
 async function handleThatsMe(incidentId: string, incident: any, userId: string, cancelReason?: string): Promise<void> {
   const ownerUserId = getOwnerUserId(incident);
   await incidentsRef.doc(incidentId).update({
-    status: 'resolved',
-    resolvedAt: new Date().toISOString(),
-    resolvedBy: userId,
+    status:          'resolved',
+    resolvedAt:      new Date().toISOString(),
+    resolvedBy:      userId,
     buzzerTriggered: false,
     ...(cancelReason ? { cancelReason } : {}),
   });
-  // Clear RTDB signal
-  await rtdb.ref(`userIncident/${ownerUserId}`).remove().catch(() => {});
+  // Clear all signals for this incident
+  await Promise.allSettled([
+    clearSignal(ownerUserId),
+    rtdb.ref(`userIncident/${ownerUserId}`).remove(),
+  ]);
   await updateOrCreateHistory(incident, 'Interrupted');
 }
 
-// Step 2b: owner "Report Intruder" → admin_pending, buzzer, history = Unauthorized
+// ── Step 2b: owner "Report Intruder" → admin_pending ─────────────────────────
 async function handleReportIntruder(incidentId: string, incident: any, userId: string): Promise<void> {
   const ownerUserId = getOwnerUserId(incident);
   if (userId !== ownerUserId) throw new Error('Only the rightful owner can report');
@@ -170,60 +216,83 @@ async function handleReportIntruder(incidentId: string, incident: any, userId: s
   const adminExpiresAt = new Date(Date.now() + 60 * 1000).toISOString();
 
   await incidentsRef.doc(incidentId).update({
-    status: 'admin_pending',
-    reportedAt: now,
-    reportedBy: userId,
-    expiresAt: adminExpiresAt,
+    status:          'admin_pending',
+    reportedAt:      now,
+    reportedBy:      userId,
+    expiresAt:       adminExpiresAt,
     buzzerTriggered: true,
   });
 
   await triggerBuzzer(incident.machineId, true);
   await updateOrCreateHistory(incident, 'Unauthorized');
-  // Clear owner RTDB signal (owner already acted)
-  await rtdb.ref(`userIncident/${ownerUserId}`).remove().catch(() => {});
 
+  // Clear owner signal — owner already acted
   await Promise.allSettled([
-    sendAndStoreNotification({
-      userId: incident.intruderId,
-      type: 'buzzer_triggered',
-      title: '🚨 Unauthorized Access Alert',
-      body: `You have been reported for unauthorized use of Machine ${incident.machineId}.`,
-      data: { machineId: incident.machineId, incidentId },
-      priority: 'high',
-    }),
-    notifyAdmins(
-      incident.machineId, incidentId,
-      '🚨 Unauthorized Access Alert',
-      `${incident.intruderName} reported by ${incident.ownerUserName || 'owner'} on Machine ${incident.machineId}. Please dismiss the buzzer.`,
-      incident.intruderId
-    ),
+    clearSignal(ownerUserId),
+    rtdb.ref(`userIncident/${ownerUserId}`).remove(),
   ]);
+
+  // Notify all admins + write incidentSignals/{adminId} for each admin
+  const adminsSnap = await incidentsRef.firestore.collection('users').where('role', '==', 'admin').get();
+  const adminTasks = adminsSnap.docs
+    .filter(doc => doc.id !== incident.intruderId)
+    .flatMap(doc => [
+      writeAdminSignal(doc.id, incidentId, incident, adminExpiresAt),
+      sendAndStoreNotification({
+        userId:   doc.id,
+        type:     'unauthorized_alert',
+        title:    '🚨 Unauthorized Access Alert',
+        body:     `${incident.intruderName} reported by ${incident.ownerUserName ?? 'owner'} on Machine ${incident.machineId}. Please dismiss the buzzer.`,
+        data:     { machineId: incident.machineId, incidentId },
+        priority: 'high',
+      }),
+    ]);
+
+  const intruderTask = sendAndStoreNotification({
+    userId:   incident.intruderId,
+    type:     'buzzer_triggered',
+    title:    '🚨 Unauthorized Access Alert',
+    body:     `You have been reported for unauthorized use of Machine ${incident.machineId}.`,
+    data:     { machineId: incident.machineId, incidentId },
+    priority: 'high',
+  });
+
+  await Promise.allSettled([...adminTasks, intruderTask]);
 }
 
-// Step 3: admin dismisses
-async function handleAdminDismiss(incidentId: string, incident: any, stopBuzzer: boolean): Promise<void> {
+// ── Step 3: admin dismisses ───────────────────────────────────────────────────
+async function handleAdminDismiss(incidentId: string, incident: any, adminUserId: string, stopBuzzer: boolean): Promise<void> {
   await incidentsRef.doc(incidentId).update({
-    status: 'dismissed',
-    resolvedAt: new Date().toISOString(),
+    status:          'dismissed',
+    resolvedAt:      new Date().toISOString(),
     buzzerTriggered: false,
   });
   if (stopBuzzer) await triggerBuzzer(incident.machineId, false);
+
+  // Clear admin signal + all other admins (in case multiple admins see it)
+  const adminsSnap = await incidentsRef.firestore.collection('users').where('role', '==', 'admin').get();
+  await Promise.allSettled(
+    adminsSnap.docs.map(doc => clearSignal(doc.id))
+  );
 }
 
-// Timeout: owner never responded → Unauthorized
+// ── Timeout: owner never responded ───────────────────────────────────────────
 async function handleTimeout(incidentId: string, incident: any): Promise<void> {
   const now = new Date().toISOString();
+  const ownerUserId = getOwnerUserId(incident);
+
   await incidentsRef.doc(incidentId).update({
-    status: 'timeout',
-    resolvedAt: now,
+    status:          'timeout',
+    resolvedAt:      now,
     buzzerTriggered: false,
   });
 
   if (incident.status === 'owner_pending') {
-    const ownerUserId = getOwnerUserId(incident);
     await updateOrCreateHistory(incident, 'Unauthorized');
-    // Clear RTDB signal
-    await rtdb.ref(`userIncident/${ownerUserId}`).remove().catch(() => {});
+    await Promise.allSettled([
+      clearSignal(ownerUserId),
+      rtdb.ref(`userIncident/${ownerUserId}`).remove(),
+    ]);
     await notifyAdmins(
       incident.machineId, incidentId,
       '🚨 Unauthorized Use — No Response',
@@ -231,6 +300,8 @@ async function handleTimeout(incidentId: string, incident: any): Promise<void> {
     );
   }
 }
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function triggerBuzzer(machineId: string, activate: boolean): Promise<void> {
   try { await getIotRef(machineId).update({ buzzerState: activate }); } catch {}
@@ -253,7 +324,6 @@ async function notifyAdmins(machineId: string, incidentId: string, title: string
 async function updateOrCreateHistory(incident: any, status: 'Interrupted' | 'Unauthorized'): Promise<void> {
   try {
     const now = new Date().toISOString();
-    // Try updating existing record first (written by QRScanViewModel)
     const snap = await db.collection('usageHistory')
       .where('incidentId', '==', incident.id)
       .limit(1).get();

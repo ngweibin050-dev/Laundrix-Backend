@@ -33,6 +33,7 @@ export type NotificationType =
   | 'unauthorized_warning'
   | 'buzzer_triggered'
   | 'clothes_ready'
+  | 'clothes_collecting'
   | 'session_started'
   | 'session_ended'
   | 'queue_joined'
@@ -76,6 +77,7 @@ function resolveAudio(type: NotificationType, overrideSound?: string, overrideCh
     case 'your_turn':
     case 'unauthorized_alert':
     case 'clothes_ready':
+    case 'clothes_collecting':
       return { soundFile: 'alarm.mp3', channelId: 'critical' };
 
     // Warnings → urgent.mp3 / urgent channel

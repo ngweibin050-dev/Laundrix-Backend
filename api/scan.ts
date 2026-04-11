@@ -105,6 +105,8 @@ export default async function handler(
       await Promise.all([
         unlockDoorFast(machineId, userId),
         rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
+        // Clear any stale clothesGrace so new session starts clean
+        rtdb.ref(`clothesGrace/${machineId}`).remove(),
       ]);
       notifySessionStarted(userId, machineId).catch(() => {});
       res.status(200).json({ success: true, result: 'already_current', message: 'Door unlocked. Welcome back!', data: { unlocked: true } });
@@ -113,13 +115,16 @@ export default async function handler(
 
     // ── Machine is IN USE by someone else → unauthorized ──────────────────────
     if (currentUserId && currentUserId !== userId) {
-      // Parallel: fetch owner data + create incident simultaneously
-      const [ownerData, incidentData] = await Promise.all([
-        getUserOptimized(currentUserId),
-        createIncidentFast(machineId, userId, user, currentUserId, { name: 'Current User', displayName: 'Current User' }),
-      ]);
+      // Fetch owner data FIRST so createIncidentFast gets the real owner name
+      // (parallel execution was causing ownerUserName: "Current User" in Firestore)
+      const ownerData = await getUserOptimized(currentUserId);
+      const incidentData = await createIncidentFast(
+        machineId, userId, user,
+        currentUserId,
+        ownerData ?? { name: 'Unknown', displayName: 'Unknown' }
+      );
 
-      const ownerName = ownerData?.displayName || ownerData?.name || 'Current User';
+      const ownerName = ownerData?.displayName || ownerData?.name || 'Unknown';
       const intruderName = user.displayName || user.name || 'Unknown';
 
       // All notifications fire-and-forget (non-blocking)
@@ -127,7 +132,6 @@ export default async function handler(
         notifyUnauthorizedAlert(currentUserId, machineId, incidentData.incidentId, intruderName),
         notifyUnauthorizedWarning(userId, machineId),
         notifyAdmins(machineId, incidentData.incidentId, userId, intruderName, 'scan'),
-        logUnauthorizedHistory(machineId, userId, intruderName, incidentData.incidentId),
         sendAndStoreNotification({
           userId,
           type: 'unauthorized_warning',
@@ -166,6 +170,8 @@ export default async function handler(
         claimMachineAtomic(machineId, userId),
         // Write currentUserId to RTDB iot/ so dashboard + queue update instantly
         rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
+        // Clear any stale clothesGrace so new session starts clean
+        rtdb.ref(`clothesGrace/${machineId}`).remove(),
         // Clear grace period — user has claimed their turn
         rtdb.ref(`gracePeriods/${machineId}`).remove(),
         rtdb.ref(`sessions/${machineId}`).set({ userId, startTime: now }),
@@ -188,6 +194,8 @@ export default async function handler(
         setCurrentUserAtomic(machineId, userId),
         // Write currentUserId to RTDB iot/ so dashboard + queue update instantly
         rtdb.ref(`iot/${machineId}`).update({ currentUserId: userId, state: 'In Use' }),
+        // Clear any stale clothesGrace so new session starts clean
+        rtdb.ref(`clothesGrace/${machineId}`).remove(),
         rtdb.ref(`sessions/${machineId}`).set({ userId, startTime: now }),
       ]);
       notifySessionStarted(userId, machineId).catch(() => {});
@@ -201,9 +209,6 @@ export default async function handler(
       machineId, userId, user,
       nextUserId!, nextUser!
     );
-
-    // FIX #5: Log unauthorized attempt to usageHistory
-    logUnauthorizedHistory(machineId, userId, user.displayName || user.name || 'Unknown', incidentData.incidentId).catch(() => {});
 
     Promise.all([
       notifyUnauthorizedAlert(nextUserId!, machineId, incidentData.incidentId, user.displayName || user.name || 'Someone'),

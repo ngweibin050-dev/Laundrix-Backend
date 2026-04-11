@@ -82,3 +82,46 @@ export async function expireGracePeriod(machineId: string): Promise<void> {
   }, 3000);
   console.log(`[grace] Expired on ${machineId}`);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Clothes Collection Grace
+// RTDB path: clothesGrace/{machineId}
+// Triggered when IoT machine state = 'Clothes Inside'
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function startClothesGrace(
+  machineId: string,
+  userId: string,
+  userName: string
+): Promise<void> {
+  const now       = new Date();
+  const expiresAt = new Date(now.getTime() + 5 * 60 * 1000);  // 5 min
+
+  await rtdb.ref(`clothesGrace/${machineId}`).set({
+    machineId,
+    userId,
+    userName,
+    startedAt:   now.toISOString(),
+    expiresAt:   expiresAt.toISOString(),
+    warningSent: false,
+    status:      'active',
+  });
+  console.log(`[clothesGrace] Started for ${userId} (${userName}) on ${machineId}`);
+}
+
+export async function markClothesCollecting(machineId: string): Promise<void> {
+  await rtdb.ref(`clothesGrace/${machineId}`).update({
+    status:      'collecting',
+    collectingAt: new Date().toISOString(),
+  });
+}
+
+export async function expireClothesGrace(machineId: string): Promise<void> {
+  await rtdb.ref(`clothesGrace/${machineId}`).update({
+    status:    'expired',
+    expiredAt: new Date().toISOString(),
+  });
+  setTimeout(() => {
+    rtdb.ref(`clothesGrace/${machineId}`).remove().catch(() => {});
+  }, 3000);
+}

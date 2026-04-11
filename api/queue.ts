@@ -1,11 +1,15 @@
 /**
  * POST /api/queue
  *
- * Unified queue endpoint — replaces /api/join-queue and /api/leave-queue
+ * FIX — FCM always 1 action behind:
+ *   Root cause: storeNotification (Firestore write the in-app list listens to)
+ *   was inside backgroundTasks which ran AFTER res.json().
+ *   Vercel terminates the function immediately after the response, so the
+ *   Firestore write sometimes never completed, or completed after the next
+ *   action's write — making the in-app list show action N+1 while FCM showed N.
  *
- * Request body: { action: "join" | "leave", machineId: string, userId: string, userName?: string, idempotencyKey?: string }
- *
- * This saves one Vercel function slot (free tier = 12 max).
+ *   Fix: storeNotification is AWAITED before res.json().
+ *        sendNotification (FCM push) is fire-and-forget after.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -18,11 +22,9 @@ import {
   updateNextUserId,
   removeUserFromQueue,
 } from '../lib/queue';
-import { sendAndStoreNotification } from '../lib/fcm';
+import { sendNotification, storeNotification } from '../lib/fcm';
 import { rtdb } from '../lib/firebase';
 import { startGracePeriod } from '../lib/grace';
-
-// ─── Types ────────────────────────────────────────────────────────────────────
 
 interface QueueRequest {
   action: 'join' | 'leave';
@@ -32,14 +34,11 @@ interface QueueRequest {
   idempotencyKey?: string;
 }
 
-// ─── Handler ─────────────────────────────────────────────────────────────────
-
 export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ): Promise<void> {
   if (handleCors(req, res)) return;
-
   if (req.method !== 'POST') {
     res.status(405).json({ success: false, error: 'Method not allowed' });
     return;
@@ -54,13 +53,8 @@ export default async function handler(
   }
 
   try {
-    if (action === 'join') {
-      return await handleJoin(req, res, machineId, userId, userName, idempotencyKey);
-    }
-    if (action === 'leave') {
-      return await handleLeave(req, res, machineId, userId);
-    }
-
+    if (action === 'join')  return await handleJoin(req, res, machineId, userId, userName, idempotencyKey);
+    if (action === 'leave') return await handleLeave(req, res, machineId, userId);
     res.status(400).json({ success: false, error: 'Invalid action. Use "join" or "leave"' });
   } catch (error) {
     console.error(`[queue/${action}] error:`, error);
@@ -83,7 +77,6 @@ async function handleJoin(
     queuesRef: m.queuesRef,
   }));
 
-  // All reads in parallel — machine, user, and queues fetched simultaneously
   const [machine, user, allMachinesSnap, allQueuesSnap] = await Promise.all([
     getMachine(machineId),
     getUser(userId),
@@ -91,53 +84,33 @@ async function handleJoin(
     qRef.get(),
   ]);
 
-  if (!machine) {
-    res.status(404).json({ success: false, error: 'Machine not found' });
-    return;
-  }
-  if (!user) {
-    res.status(404).json({ success: false, error: 'User not found' });
-    return;
-  }
+  if (!machine) { res.status(404).json({ success: false, error: 'Machine not found' }); return; }
+  if (!user)    { res.status(404).json({ success: false, error: 'User not found' }); return; }
   if (machine.currentUserId === userId) {
     res.status(400).json({ success: false, error: 'You are currently using this machine', code: 'ALREADY_CURRENT_USER' });
     return;
   }
 
-  // Check queues from the already-fetched allQueuesSnap (no extra reads needed)
-  const thisQueueDoc = allQueuesSnap.docs.find(d => d.id === machineId);
-  const thisQueueUsers: any[] = thisQueueDoc?.data()?.users ?? [];
-  const userInQueue = thisQueueUsers.some((u: any) => u.userId === userId);
-
-  if (userInQueue) {
+  const thisQueueDoc   = allQueuesSnap.docs.find((d: any) => d.id === machineId);
+  const thisQueueUsers = (thisQueueDoc?.data()?.users ?? []) as any[];
+  if (thisQueueUsers.some((u: any) => u.userId === userId)) {
     res.status(400).json({ success: false, error: 'Already in queue for this machine', code: 'ALREADY_IN_QUEUE' });
     return;
   }
 
-  // ── One-machine-one-queue enforcement ─────────────────────────────────────
   if (!allMachinesSnap.empty) {
     const otherMachineId = allMachinesSnap.docs[0].id;
-    res.status(400).json({
-      success: false,
-      error: `You are already using Machine ${otherMachineId}. Please complete your current session first.`,
-      code: 'ALREADY_USING_MACHINE',
-    });
+    res.status(400).json({ success: false, error: `You are already using Machine ${otherMachineId}.`, code: 'ALREADY_USING_MACHINE' });
     return;
   }
-  // Check if user is already in a queue for any OTHER machine (from already-fetched snap)
   for (const qDoc of allQueuesSnap.docs) {
     if (qDoc.id === machineId) continue;
-    const users: any[] = qDoc.data()?.users ?? [];
+    const users = (qDoc.data()?.users ?? []) as any[];
     if (users.some((u: any) => u.userId === userId)) {
-      res.status(400).json({
-        success: false,
-        error: `You are already in the queue for Machine ${qDoc.id}. Leave that queue first.`,
-        code: 'ALREADY_IN_OTHER_QUEUE',
-      });
+      res.status(400).json({ success: false, error: `Already in queue for Machine ${qDoc.id}.`, code: 'ALREADY_IN_OTHER_QUEUE' });
       return;
     }
   }
-  // ──────────────────────────────────────────────────────────────────────────
 
   const queueUser = await addUserToQueue(
     machineId,
@@ -147,63 +120,46 @@ async function handleJoin(
     idempotencyKey
   );
 
-  if (!queueUser) {
-    res.status(500).json({ success: false, error: 'Failed to add to queue' });
-    return;
-  }
+  if (!queueUser) { res.status(500).json({ success: false, error: 'Failed to add to queue' }); return; }
 
-  // Situation A: machine is free + user is now at position 1 → start grace immediately
-  const isMachineFree = !machine.currentUserId;
+  const isMachineFree  = !machine.currentUserId;
   const isFirstInQueue = queueUser.position === 1;
-  const resolvedName = userName || (user as any).displayName || (user as any).name || 'Unknown';
+  const resolvedName   = userName || (user as any).displayName || (user as any).name || 'Unknown';
 
-  // ── Situation A: machine free + user is #1 in queue → start grace period NOW ─
-  // CRITICAL: startGracePeriod must be AWAITED before sending the response.
-  // Previously it was fire-and-forget in backgroundTasks, causing a race where
-  // the frontend subscription fired (seeing the new queue entry) BEFORE the grace
-  // node existed in RTDB — so GraceAlarmModal found nothing and never showed.
-  if (isMachineFree && isFirstInQueue) {
-    await startGracePeriod(machineId, userId, resolvedName);
-  }
-
-  // Non-critical notifications — fire-and-forget (no await needed)
-  const backgroundTasks: Promise<any>[] = [
-    // NOTE: addUserToQueue already updates nextUserId in its transaction for
-    // position-1 users, so updateNextUserId is only needed for subsequent users.
-    ...(isFirstInQueue ? [] : [updateNextUserId(machineId)]),
-    sendAndStoreNotification({
-      userId,
-      type: 'queue_joined',
-      title: '✅ Joined Queue',
-      body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
-      data: { machineId, position: queueUser.position.toString() },
-    }),
+  // ── AWAIT before responding: Firestore store + RTDB grace must exist ─────
+  // This guarantees in-app notification list is always up to date when the
+  // client refreshes, and GraceAlarmModal finds the RTDB node immediately.
+  await Promise.all([
+    ...(isMachineFree && isFirstInQueue ? [startGracePeriod(machineId, userId, resolvedName)] : []),
+    storeNotification(userId, 'queue_joined', '✅ Joined Queue',
+      `You are #${queueUser.position} in line for Machine ${machineId}.`,
+      { machineId, position: queueUser.position.toString() }),
     ...(isMachineFree && isFirstInQueue ? [
-      sendAndStoreNotification({
-        userId,
-        type: 'your_turn',
-        title: '🎉 Your Turn!',
-        body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
-        data: { machineId },
-        sound: 'alarm',
-        priority: 'high',
-      }),
+      storeNotification(userId, 'your_turn', '🎉 Your Turn!',
+        `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
+        { machineId }),
     ] : []),
-  ];
+    ...(isFirstInQueue ? [] : [updateNextUserId(machineId)]),
+  ]);
 
-  Promise.all(backgroundTasks).catch((err) => console.error('[queue/join] background error:', err));
-
-    console.log(`User ${userId} joined queue for ${machineId} at position ${queueUser.position}`);
-
+  console.log(`User ${userId} joined queue for ${machineId} at position ${queueUser.position}`);
   res.status(200).json({
     success: true,
     message: `Joined queue at position ${queueUser.position}`,
-    data: {
-      position: queueUser.position,
-      queueToken: queueUser.queueToken,
-      joinedAt: queueUser.joinedAt,
-    },
+    data: { position: queueUser.position, queueToken: queueUser.queueToken, joinedAt: queueUser.joinedAt },
   });
+
+  // ── FCM push AFTER response — best-effort, never causes lag ───────────────
+  Promise.all([
+    sendNotification({ userId, type: 'queue_joined', title: '✅ Joined Queue',
+      body: `You are #${queueUser.position} in line for Machine ${machineId}.`,
+      data: { machineId, position: queueUser.position.toString() } }),
+    ...(isMachineFree && isFirstInQueue ? [
+      sendNotification({ userId, type: 'your_turn', title: '🎉 Your Turn!',
+        body: `Machine ${machineId} is ready! You have 5 minutes to scan in.`,
+        data: { machineId }, sound: 'alarm', priority: 'high' }),
+    ] : []),
+  ]).catch(err => console.error('[queue/join] FCM error:', err));
 }
 
 // ─── Leave ────────────────────────────────────────────────────────────────────
@@ -215,32 +171,24 @@ async function handleLeave(
   userId: string
 ): Promise<void> {
   const userInQueue = await isUserInQueue(machineId, userId);
-  if (!userInQueue) {
-    res.status(400).json({ success: false, error: 'Not in queue for this machine' });
-    return;
-  }
+  if (!userInQueue) { res.status(400).json({ success: false, error: 'Not in queue for this machine' }); return; }
 
   const removed = await removeUserFromQueue(machineId, userId);
-  if (!removed) {
-    res.status(500).json({ success: false, error: 'Failed to leave queue' });
-    return;
-  }
+  if (!removed) { res.status(500).json({ success: false, error: 'Failed to leave queue' }); return; }
 
-  // Background: update nextUserId + notify
-  Promise.all([
+  // ── AWAIT before responding: Firestore store always committed ────────────
+  await Promise.all([
     updateNextUserId(machineId),
-    sendAndStoreNotification({
-      userId,
-      type: 'queue_left',
-      title: '👋 Left Queue',
-      body: `You've left the queue for Machine ${machineId}.`,
-      data: { machineId },
-    }),
-  ]).catch((err) => console.error('[queue/leave] background error:', err));
+    storeNotification(userId, 'queue_left', '👋 Left Queue',
+      `You've left the queue for Machine ${machineId}.`,
+      { machineId }),
+  ]);
 
   console.log(`User ${userId} left queue for ${machineId}`);
-
   res.status(200).json({ success: true, message: 'Successfully left the queue' });
-}
 
-// startGracePeriod is imported from lib/grace.ts
+  // ── FCM push AFTER response — best-effort ─────────────────────────────────
+  sendNotification({ userId, type: 'queue_left', title: '👋 Left Queue',
+    body: `You've left the queue for Machine ${machineId}.`, data: { machineId } })
+    .catch(err => console.error('[queue/leave] FCM error:', err));
+}

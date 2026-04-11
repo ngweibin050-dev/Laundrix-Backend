@@ -95,16 +95,32 @@ export default async function handler(
       // ── missed call ──
       if (action === "missed") {
         const sent = await notifyMissedCall(recipientId, callerName, isVideo);
-
-        res.status(200).json({
-          success: true,
-          message: "Missed call notification sent",
-          data: { sent, stored: true },
-        });
+        res.status(200).json({ success: true, message: "Missed call notification sent", data: { sent, stored: true } });
         return;
       }
 
-      res.status(400).json({ success: false, error: "Invalid action. Use 'incoming' or 'missed'" });
+      // ── cancelled call (caller cancelled before answer) ──
+      if (action === "cancelled") {
+        await sendAndStoreNotification({
+          userId:   recipientId,
+          type:     isVideo ? 'missed_video' : 'missed_call',
+          title:    isVideo ? '📹 Missed Video Call' : '📞 Missed Call',
+          body:     `${callerName} cancelled a call`,
+          data:     { callerId, callerName, type: isVideo ? 'missed_video' : 'missed_call' },
+          priority: 'normal',
+        });
+        res.status(200).json({ success: true, message: "Cancelled call notification sent", data: { sent: true, stored: true } });
+        return;
+      }
+
+      // ── ended call (for call history notification) ──
+      if (action === "ended") {
+        // No push notification for ended — UI handles this via real-time Firestore
+        res.status(200).json({ success: true, message: "Ended call (no push)", data: { sent: false, stored: false } });
+        return;
+      }
+
+      res.status(400).json({ success: false, error: "Invalid action. Use 'incoming', 'missed', 'cancelled', or 'ended'" });
       return;
     }
 

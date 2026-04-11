@@ -16,9 +16,9 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { rtdb, incidentsRef, getCommandsRef, db } from '../lib/firebase';
 import { getNextUser, removeUserFromQueue, updateNextUserId } from '../lib/queue';
-import { notifyYourTurn, sendAndStoreNotification } from '../lib/fcm';
-import { startGracePeriod, expireGracePeriod } from '../lib/grace';
-import type { GracePeriod, Incident } from '../lib/types';
+import { notifyYourTurn, sendAndStoreNotification, storeNotification, sendNotification } from '../lib/fcm';
+import { startGracePeriod, expireGracePeriod, startClothesGrace, expireClothesGrace } from '../lib/grace';
+import type { GracePeriod, ClothesGracePeriod, Incident } from '../lib/types';
 
 export default async function handler(
   req: VercelRequest,
@@ -124,8 +124,11 @@ export default async function handler(
           resolvedBy:      'cron',
         });
 
-        // Clear RTDB owner signal
-        await rtdb.ref(`userIncident/${ownerUserId}`).remove().catch(() => {});
+        // Clear RTDB owner signal + Firestore incidentSignals doc
+        await Promise.allSettled([
+          rtdb.ref(`userIncident/${ownerUserId}`).remove(),
+          db.collection('incidentSignals').doc(ownerUserId).delete(),
+        ]);
 
         // Write Unauthorized history
         try {
@@ -202,6 +205,111 @@ export default async function handler(
     results.incidents.errors.push(`scan_failed: ${err.message}`);
   }
 
+  // ─────────────────────────────────────────────
+  // TASK 3: Clothes Inside → Start Collection Grace
+  // Detects RTDB iot/{machineId}/state === 'Clothes Inside'
+  // and starts a 5-min collection grace if one doesn't exist yet.
+  // ─────────────────────────────────────────────
+  const clothesResults = { processed: [] as string[], errors: [] as string[] };
+  try {
+    const [iotSnap, clothesGraceSnap] = await Promise.all([
+      rtdb.ref('iot').get(),
+      rtdb.ref('clothesGrace').get(),
+    ]);
+
+    if (iotSnap.exists()) {
+      const iotData = iotSnap.val() as Record<string, any>;
+      const existingGraces = clothesGraceSnap.exists()
+        ? (clothesGraceSnap.val() as Record<string, any>)
+        : {};
+
+      for (const [machineId, iotMachine] of Object.entries(iotData)) {
+        try {
+          if (iotMachine?.state !== 'Clothes Inside') continue;
+
+          const existing = existingGraces[machineId];
+          // Already have an active or collecting grace — skip
+          if (existing && (existing.status === 'active' || existing.status === 'collecting')) continue;
+
+          // Need to know who the current user is
+          const currentUserId = iotMachine?.currentUserId;
+          if (!currentUserId) continue;
+
+          // Fetch user name
+          const userSnap = await db.collection('users').doc(currentUserId).get();
+          if (!userSnap.exists) continue;
+          const userData = userSnap.data()!;
+          const userName = userData.displayName || userData.name || 'Unknown';
+
+          // Start the clothes collection grace
+          await startClothesGrace(machineId, currentUserId, userName);
+
+          // Notify the current user — alarm sound
+          await storeNotification(currentUserId, 'clothes_ready',
+            '👕 Clothes Ready!',
+            `Your laundry at Machine ${machineId} is done. Please collect your clothes within 5 minutes.`,
+            { machineId });
+          sendNotification({
+            userId: currentUserId, type: 'clothes_ready',
+            title: '👕 Clothes Ready!',
+            body: `Your laundry at Machine ${machineId} is done. Please collect your clothes within 5 minutes.`,
+            data: { machineId }, sound: 'alarm', priority: 'high',
+          }).catch(() => {});
+
+          // Notify all admins — so they can monitor whether clothes are collected
+          const adminsSnap = await db.collection('users').where('role', '==', 'admin').get();
+          const adminNotifyPromises = adminsSnap.docs
+            .filter(doc => doc.id !== currentUserId)
+            .map(async doc => {
+              await storeNotification(doc.id, 'clothes_collecting',
+                `👁️ Clothes Ready – Machine ${machineId}`,
+                `${userName}'s laundry is done. They have 5 minutes to collect.`,
+                { machineId, userId: currentUserId, userName });
+              sendNotification({
+                userId: doc.id, type: 'clothes_collecting',
+                title: `👁️ Clothes Ready – Machine ${machineId}`,
+                body: `${userName}'s laundry is done. They have 5 minutes to collect.`,
+                data: { machineId, userId: currentUserId, userName },
+                priority: 'high',
+              }).catch(() => {});
+            });
+          await Promise.all(adminNotifyPromises);
+
+          clothesResults.processed.push(`${machineId}: clothes grace started for ${currentUserId}`);
+        } catch (err: any) {
+          console.error(`[Cron] Clothes grace error for ${machineId}:`, err);
+          clothesResults.errors.push(`${machineId}: ${err.message}`);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.error('[Cron] Clothes Inside scan failed:', err);
+    clothesResults.errors.push(`scan_failed: ${err.message}`);
+  }
+
+  // ─────────────────────────────────────────────
+  // TASK 4: Clothes Grace Expiry
+  // ─────────────────────────────────────────────
+  try {
+    const now = new Date().toISOString();
+    const clothesSnap = await rtdb.ref('clothesGrace').get();
+    if (clothesSnap.exists()) {
+      const graces = clothesSnap.val() as Record<string, ClothesGracePeriod>;
+      for (const [machineId, cg] of Object.entries(graces)) {
+        try {
+          if (cg.status !== 'active' && cg.status !== 'collecting') continue;
+          if (cg.expiresAt > now) continue;
+          await expireClothesGrace(machineId);
+          clothesResults.processed.push(`${machineId}: clothes grace expired for ${cg.userId}`);
+        } catch (err: any) {
+          clothesResults.errors.push(`${machineId}_expire: ${err.message}`);
+        }
+      }
+    }
+  } catch (err: any) {
+    clothesResults.errors.push(`expire_scan_failed: ${err.message}`);
+  }
+
   res.status(200).json({
     success:   true,
     timestamp: new Date().toISOString(),
@@ -214,6 +322,11 @@ export default async function handler(
       processed: results.incidents.processed.length,
       errors:    results.incidents.errors.length,
       details:   results.incidents,
+    },
+    clothesGrace: {
+      processed: clothesResults.processed.length,
+      errors:    clothesResults.errors.length,
+      details:   clothesResults,
     },
   });
 }
