@@ -1,472 +1,78 @@
-# Laundrix Backend API
+# Laundrix Backend
 
-Serverless backend for the Laundrix IoT laundry machine tracking system.
-Deployed on Vercel (100% free tier).
+Serverless API for [Laundrix](https://github.com/ngweibin050-dev/Laundrix), the smart laundry IoT system. It runs on Vercel's free tier and owns everything that must not be decided on a phone: who gets the machine, queue order, grace-period expiry, unauthorized-use incidents and push notifications.
 
-## 🚀 Quick Start
+**Live:** [laundrix-backend.vercel.app](https://laundrix-backend.vercel.app) · TypeScript · Firebase Admin SDK · Vercel serverless functions
 
-### 1. Prerequisites
+## Endpoints
 
-- [Node.js 18+](https://nodejs.org/)
-- [Vercel CLI](https://vercel.com/cli): `npm i -g vercel`
-- Firebase project with service account
+To stay inside Vercel's 12-function free-tier limit, related operations share one endpoint and are selected with an `action` field.
 
-### 2. Clone and Install
+| Endpoint | Actions | What it does |
+| --- | --- | --- |
+| `POST /api/scan` | – | QR scan at a machine. Results: `authorized`, `queue_empty_claim`, `already_current`, `unauthorized`, `machine_not_found` or `user_not_found`. Unauthorized scans create an incident and notify the owner and admins; authorized scans unlock the machine and record the session start |
+| `POST /api/queue` | `join`, `leave` | Join or leave a machine's queue. Uses Firestore transactions and an idempotency key so double taps can't add a user twice; starts the 5-minute grace period when the user is first in line and the machine is free |
+| `POST /api/release` | – | Ends a session: checks the caller is the current user, writes the usage record (start, end, duration), frees the machine and notifies the next user |
+| `POST /api/grace-actions` | `claim`, `dismiss-alarm`, `collect-clothes`, `start-clothes` | Claim your turn, silence the alarm, and the "collect your clothes" grace period |
+| `POST /api/incident-action` | `confirm`, `thats_me`, `dismiss`, `confirm_not_me`, `admin_dismiss`, `admin_dismiss_false`, `timeout` | Staged unauthorized-use flow (below) |
+| `POST /api/grace-timeout` | – | Grace-period warning/expiry; called only by the cron job |
+| `GET /api/cron` | – | Runs every minute: expires grace periods once (removing no-shows from the queue) and times out incidents the owner didn't answer (logged as unauthorized use, admins notified). Requires `x-cron-secret` |
+| `POST /api/notify` | `type: call` / `type: chat` | Push notifications for incoming, missed, cancelled and ended calls and for chat messages |
+| `POST /api/livekit-token` | – | Issues a LiveKit access token so two users can join a voice or video call room |
+| `POST /api/admin` | `cleanup-queue`, `user-deleted` | Removes deleted users from all queues |
+| `GET /api/warmup` | – | Opens Firestore and Realtime Database connections so the first real request isn't slow |
+
+### Unauthorized-use incidents
+
+```mermaid
+stateDiagram-v2
+    [*] --> pre_pending: someone scans out of turn
+    pre_pending --> owner_pending: intruder confirms
+    owner_pending --> resolved: owner taps "That's me"
+    owner_pending --> admin_pending: owner taps "Not me"
+    owner_pending --> timeout: no answer in 60 s
+    admin_pending --> dismissed: admin turns off the buzzer
+    note right of timeout: logged as unauthorized use,<br/>admins notified
+```
+
+Signals reach each person's phone through a per-user `incidentSignals/{uid}` document. Firestore rules stop regular users from querying the shared `incidents` collection, so each person only sees their own signal.
+
+### Why the cron job owns expiry
+
+Earlier, every phone in the queue called `grace-timeout` when a countdown hit zero, so a user could be removed several times at once. Now only the server cron expires grace periods. It runs once per expiry, so the queue is updated exactly once.
+
+## Notifications
+
+`lib/fcm.ts` sends Firebase Cloud Messaging pushes on high-priority Android channels and also stores every notification in Firestore for the in-app history. Events include: your turn, grace warning, removed from queue, unauthorized alert/warning, buzzer triggered, clothes ready, session started/ended, queue joined, chat message, and incoming/missed calls.
+
+## Security
+
+- **Done:**
+  - Firebase Admin credentials, the LiveKit secret and the cron secret come only from Vercel environment variables.
+  - Ownership checks on state-changing actions: only the current user can release a machine, only the right user can claim a grace period or dismiss an alarm.
+  - `/api/cron` requires `x-cron-secret`.
+- **Not yet done:** the endpoints don't verify a Firebase ID token. They trust the `userId` in the request body, so someone who knows another user's ID could act as them, and `/api/admin` is open. The fix is to require `Authorization: Bearer <ID token>` on every endpoint, check that the token's uid matches `userId`, check the admin role for `/api/admin`, and send the token from the app's `apiCall` helper. CORS is also set to `*` in `vercel.json` and should be limited to the app's origins.
+
+## Setup
 
 ```bash
-cd laundrix-backend
 npm install
+# create .env.local with the variables below
+npx vercel dev                  # http://localhost:3000
+npm run type-check
 ```
 
-### 3. Get Firebase Service Account
+| Variable | Purpose |
+| --- | --- |
+| `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`, `FIREBASE_DATABASE_URL` | Firebase Admin service account and Realtime Database |
+| `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Voice/video call tokens |
+| `CRON_SECRET_KEY` | Protects `/api/cron` |
 
-1. Go to [Firebase Console](https://console.firebase.google.com/) → Project Settings → Service Accounts
-2. Click "Generate new private key"
-3. Save the JSON file (keep it secret!)
+`FIREBASE_PRIVATE_KEY` must keep its `\n` line breaks and be wrapped in quotes. Deploy with `vercel --prod`, set the same variables in **Project → Settings → Environment Variables**, and schedule `GET /api/cron` every minute with the `x-cron-secret` header.
 
-### 4. Configure Environment Variables
-
-Create a `.env.local` file for local development:
-
-```env
-FIREBASE_PROJECT_ID=xxxxxx
-FIREBASE_CLIENT_EMAIL=xxxxxx
-FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-FIREBASE_DATABASE_URL=xxxxxx
-```
-
-**Important:** The private key must include the `\n` characters and be wrapped in quotes.
-
-### 5. Run Locally
-
-```bash
-vercel dev
-```
-
-Server runs at `http://localhost:3000`
-
-### 6. Deploy to Vercel
-
-```bash
-# Login to Vercel (first time only)
-vercel login
-
-# Deploy to preview
-vercel
-
-# Deploy to production
-vercel --prod
-```
-
-### 7. Set Production Environment Variables
-
-```bash
-vercel env add FIREBASE_PROJECT_ID
-vercel env add FIREBASE_CLIENT_EMAIL
-vercel env add FIREBASE_PRIVATE_KEY
-vercel env add FIREBASE_DATABASE_URL
-```
-
-Or set them in the Vercel Dashboard → Project → Settings → Environment Variables
-
----
-
-## 📡 API Endpoints
-
-### Health Check
-```
-GET /api/health
-```
-
-### QR Code Scan
-```
-POST /api/scan
-Body: { machineId: "M001", userId: "user123" }
-```
-
-### Release Machine (End Session)
-```
-POST /api/release
-Body: { machineId: "M001", userId: "user123" }
-```
-
-### Join Queue
-```
-POST /api/join-queue
-Body: { machineId: "M001", userId: "user123" }
-```
-
-### Leave Queue
-```
-POST /api/leave-queue
-Body: { machineId: "M001", userId: "user123" }
-```
-
-### Incident Actions (Unauthorized Access)
-```
-POST /api/incident-action
-Body: { 
-  incidentId: "incident123", 
-  userId: "user123", 
-  action: "confirm_not_me" | "dismiss" | "timeout" 
-}
-```
-
-### Grace Period Timeout
-```
-POST /api/grace-timeout
-Body: { 
-  machineId: "M001", 
-  userId: "user123", 
-  timeoutType: "warning" | "expired" 
-}
-```
-
-### Claim Grace Period
-```
-POST /api/claim-grace
-Body: { machineId: "M001", userId: "user123" }
-```
-
-### Dismiss Alarm
-```
-POST /api/dismiss-alarm
-Body: { machineId: "M001", userId: "user123" }
-```
-
----
-
-## 🔄 Flow Diagrams
-
-### Normal Flow: Claiming Machine
+## Project layout
 
 ```
-User scans QR
-    │
-    ▼
-POST /api/scan
-    │
-    ├─▶ User is currentUserId? → Unlock door, return success
-    │
-    ├─▶ User is nextUserId? → Remove from queue, set as current, unlock
-    │
-    ├─▶ Queue empty? → Set as current, unlock
-    │
-    └─▶ Unauthorized → Create incident, notify both users
+api/     one file per endpoint (Vercel functions)
+lib/     firebase.ts (Admin init), queue.ts, grace.ts, fcm.ts, cors.ts, types.ts
 ```
-
-### Grace Period Flow
-
-```
-currentUserId releases machine
-    │
-    ▼
-POST /api/release
-    │
-    ▼
-Notify nextUserId (alarm sound)
-    │
-    ▼
-Start 5-min grace period
-    │
-    ├─▶ nextUserId scans within 5 min
-    │       │
-    │       ▼
-    │   POST /api/scan → Success, clear grace period
-    │
-    ├─▶ 2 min passes (no scan)
-    │       │
-    │       ▼
-    │   POST /api/grace-timeout (warning)
-    │   → Send "Hurry up!" notification
-    │
-    └─▶ 5 min passes (no scan)
-            │
-            ▼
-    POST /api/grace-timeout (expired)
-    → Remove from queue, notify next user
-```
-
-### Unauthorized Access Flow
-
-```
-Unauthorized user scans QR
-    │
-    ▼
-POST /api/scan → Returns incidentId
-    │
-    ├─▶ Intruder receives warning notification
-    │
-    └─▶ nextUserId receives alarm: "Someone at your machine!"
-            │
-            ▼
-    ┌───────┴───────┐
-    │               │
-    ▼               ▼
-"Not me" tap    60s timeout
-    │               │
-    ▼               ▼
-POST /api/incident-action (confirm_not_me | timeout)
-    │
-    ▼
-Trigger buzzer on ESP32
-```
-
----
-
-## 📱 React Native Integration
-
-### API Service Example
-
-```typescript
-// services/api.ts
-const API_BASE = 'https://your-app.vercel.app';
-
-export const LaundrixAPI = {
-  async scan(machineId: string, userId: string) {
-    const response = await fetch(`${API_BASE}/api/scan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ machineId, userId }),
-    });
-    return response.json();
-  },
-
-  async release(machineId: string, userId: string) {
-    const response = await fetch(`${API_BASE}/api/release`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ machineId, userId }),
-    });
-    return response.json();
-  },
-
-  async handleIncident(incidentId: string, userId: string, action: string) {
-    const response = await fetch(`${API_BASE}/api/incident-action`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ incidentId, userId, action }),
-    });
-    return response.json();
-  },
-
-  async graceTimeout(machineId: string, userId: string, timeoutType: string) {
-    const response = await fetch(`${API_BASE}/api/grace-timeout`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ machineId, userId, timeoutType }),
-    });
-    return response.json();
-  },
-};
-```
-
-### QR Scan Handler Example
-
-```typescript
-// screens/QRScan.tsx
-const handleQRScan = async (data: string) => {
-  const machineId = data; // QR contains machine ID e.g., "M001"
-  const userId = auth().currentUser?.uid;
-
-  const result = await LaundrixAPI.scan(machineId, userId);
-
-  if (result.success) {
-    // Door unlocked!
-    showToast('Door unlocked! 🎉');
-    navigation.navigate('MachineStatus', { machineId });
-  } else if (result.result === 'unauthorized') {
-    // Show warning
-    showAlert('Not Your Turn', result.message);
-  }
-};
-```
-
-### Grace Period Countdown Example
-
-```typescript
-// components/GracePeriodCountdown.tsx
-const GracePeriodCountdown = ({ machineId, userId, expiresAt }) => {
-  const [secondsLeft, setSecondsLeft] = useState(300); // 5 minutes
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const remaining = Math.max(0, 
-        Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)
-      );
-      setSecondsLeft(remaining);
-
-      // Send warning at 2 minutes
-      if (remaining === 180) {
-        LaundrixAPI.graceTimeout(machineId, userId, 'warning');
-      }
-
-      // Send expired at 0
-      if (remaining === 0) {
-        LaundrixAPI.graceTimeout(machineId, userId, 'expired');
-        clearInterval(interval);
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [expiresAt]);
-
-  return (
-    <View>
-      <Text>Time remaining: {Math.floor(secondsLeft / 60)}:{(secondsLeft % 60).toString().padStart(2, '0')}</Text>
-    </View>
-  );
-};
-```
-
-### Incident Alert Example
-
-```typescript
-// components/IncidentAlert.tsx
-const IncidentAlert = ({ incidentId, machineId, intruderName, expiresAt }) => {
-  const userId = auth().currentUser?.uid;
-  const [secondsLeft, setSecondsLeft] = useState(60);
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      const remaining = Math.max(0,
-        Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000)
-      );
-      setSecondsLeft(remaining);
-
-      if (remaining === 0) {
-        // Auto-timeout
-        LaundrixAPI.handleIncident(incidentId, userId, 'timeout');
-        clearInterval(interval);
-      }
-    }, 1000);
-
-    return () => clearInterval(interval);
-  }, [expiresAt]);
-
-  const handleNotMe = async () => {
-    await LaundrixAPI.handleIncident(incidentId, userId, 'confirm_not_me');
-    // Buzzer will ring
-  };
-
-  const handleThatsMe = async () => {
-    await LaundrixAPI.handleIncident(incidentId, userId, 'dismiss');
-    // Scan was actually them, dismiss
-  };
-
-  return (
-    <Modal visible={true}>
-      <Text>🚨 Someone at your machine!</Text>
-      <Text>{intruderName} is trying to use Machine {machineId}</Text>
-      <Text>Responding in: {secondsLeft}s</Text>
-      <Button onPress={handleThatsMe}>That's me ✓</Button>
-      <Button onPress={handleNotMe}>Not me ✗</Button>
-    </Modal>
-  );
-};
-```
-
----
-
-## 🔔 FCM Setup for Lock Screen Notifications
-
-### 1. Add to React Native App
-
-```bash
-npm install @react-native-firebase/messaging
-```
-
-### 2. Configure Android Channel
-
-```java
-// android/app/src/main/java/.../MainApplication.java
-import android.app.NotificationChannel;
-import android.app.NotificationManager;
-
-// In onCreate():
-if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-    NotificationChannel urgentChannel = new NotificationChannel(
-        "urgent_alerts",
-        "Urgent Alerts",
-        NotificationManager.IMPORTANCE_HIGH
-    );
-    urgentChannel.setDescription("Urgent laundry alerts");
-    urgentChannel.enableVibration(true);
-    urgentChannel.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
-    
-    NotificationManager manager = getSystemService(NotificationManager.class);
-    manager.createNotificationChannel(urgentChannel);
-}
-```
-
-### 3. Store FCM Token in Firestore
-
-```typescript
-// App.tsx
-import messaging from '@react-native-firebase/messaging';
-
-useEffect(() => {
-  const getToken = async () => {
-    const token = await messaging().getToken();
-    const userId = auth().currentUser?.uid;
-    
-    if (userId) {
-      await firestore().collection('users').doc(userId).update({
-        fcmToken: token,
-      });
-    }
-  };
-
-  getToken();
-
-  // Listen for token refresh
-  return messaging().onTokenRefresh(token => {
-    const userId = auth().currentUser?.uid;
-    if (userId) {
-      firestore().collection('users').doc(userId).update({ fcmToken: token });
-    }
-  });
-}, []);
-```
-
----
-
-## 📁 Project Structure
-
-```
-laundrix-backend/
-├── api/
-│   ├── scan.ts              # QR scan verification
-│   ├── release.ts           # End session
-│   ├── join-queue.ts        # Join queue
-│   ├── leave-queue.ts       # Leave queue
-│   ├── incident-action.ts   # Handle unauthorized incidents
-│   ├── grace-timeout.ts     # Grace period timeouts
-│   ├── claim-grace.ts       # Claim during grace period
-│   ├── dismiss-alarm.ts     # Dismiss buzzer
-│   └── health.ts            # Health check
-├── lib/
-│   ├── firebase.ts          # Firebase Admin SDK init
-│   ├── fcm.ts               # Push notification helpers
-│   ├── queue.ts             # Queue management
-│   └── types.ts             # TypeScript types
-├── package.json
-├── tsconfig.json
-├── vercel.json
-└── README.md
-```
-
----
-
-## 🔐 Security Notes
-
-1. **Service Account**: Never commit the Firebase service account JSON to git
-2. **Environment Variables**: Use Vercel's encrypted environment variables
-3. **User Verification**: All endpoints should verify userId matches the authenticated user
-4. **Rate Limiting**: Consider adding rate limiting for production
-
----
-
-## 📝 License
-
-MIT
