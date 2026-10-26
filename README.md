@@ -29,10 +29,10 @@ npm install
 Create a `.env.local` file for local development:
 
 ```env
-FIREBASE_PROJECT_ID=laundrix-f6591
-FIREBASE_CLIENT_EMAIL=firebase-adminsdk-xxxxx@laundrix-f6591.iam.gserviceaccount.com
+FIREBASE_PROJECT_ID=xxxxxx
+FIREBASE_CLIENT_EMAIL=xxxxxx
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-FIREBASE_DATABASE_URL=https://laundrix-f6591-default-rtdb.asia-southeast1.firebasedatabase.app
+FIREBASE_DATABASE_URL=xxxxxx
 ```
 
 **Important:** The private key must include the `\n` characters and be wrapped in quotes.
