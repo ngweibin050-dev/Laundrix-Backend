@@ -152,11 +152,14 @@ async function handleConfirm(incidentId: string, incident: any, userId: string):
     expiresAt:   newExpiresAt,
   });
 
-  // 2. Write to incidentSignals/{ownerUserId} — primary signal, guaranteed readable by owner
+  // 2. Trigger buzzer immediately when intruder acknowledges
+  await triggerBuzzer(incident.machineId, true);
+
+  // 3. Write to incidentSignals/{ownerUserId} — primary signal, guaranteed readable by owner
   //    (direct doc read, no query, no security rule complexity)
   await writeOwnerSignal(ownerUserId, incidentId, incident, newExpiresAt);
 
-  // 3. Also write RTDB as backup (works if RTDB rules are set up correctly)
+  // 4. Also write RTDB as backup (works if RTDB rules are set up correctly)
   rtdb.ref(`userIncident/${ownerUserId}`).set({
     incidentId,
     machineId:     incident.machineId,
@@ -199,6 +202,8 @@ async function handleThatsMe(incidentId: string, incident: any, userId: string, 
     buzzerTriggered: false,
     ...(cancelReason ? { cancelReason } : {}),
   });
+  // Turn off buzzer — owner confirmed it was them, so the alarm was a false flag
+  await triggerBuzzer(incident.machineId, false);
   // Clear all signals for this incident
   await Promise.allSettled([
     clearSignal(ownerUserId),

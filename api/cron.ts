@@ -310,6 +310,51 @@ export default async function handler(
     clothesResults.errors.push(`expire_scan_failed: ${err.message}`);
   }
 
+  // ─────────────────────────────────────────────
+  // TASK 5: Machine Liveness Check
+  // If iot/{machineId}/lastPing is older than OFFLINE_THRESHOLD_MS,
+  // set isLive: false so the app reflects offline status accurately.
+  // Threshold matches frontend: 90 seconds.
+  // ─────────────────────────────────────────────
+  const OFFLINE_THRESHOLD_MS = 90_000;
+  const livenessResults = { processed: [] as string[], errors: [] as string[] };
+  try {
+    const iotSnap = await rtdb.ref('iot').get();
+    if (iotSnap.exists()) {
+      const iotData = iotSnap.val() as Record<string, any>;
+      const nowMs = Date.now();
+      const updates: Record<string, boolean> = {};
+
+      for (const [machineId, data] of Object.entries(iotData)) {
+        try {
+          const lastPing: number = data?.lastPing ?? 0;
+          const isStale = nowMs - lastPing > OFFLINE_THRESHOLD_MS;
+          const currentlyLive: boolean = data?.isLive ?? false;
+
+          // Only write when state needs to change — avoid unnecessary RTDB writes
+          if (isStale && currentlyLive) {
+            updates[`iot/${machineId}/isLive`] = false;
+            livenessResults.processed.push(`${machineId}: offline (${Math.round((nowMs - lastPing) / 1000)}s since ping)`);
+          } else if (!isStale && !currentlyLive) {
+            // Machine came back online — flip it live again
+            updates[`iot/${machineId}/isLive`] = true;
+            livenessResults.processed.push(`${machineId}: back online`);
+          }
+        } catch (err: any) {
+          livenessResults.errors.push(`${machineId}: ${err.message}`);
+        }
+      }
+
+      // Single batched RTDB write for all changes
+      if (Object.keys(updates).length > 0) {
+        await rtdb.ref().update(updates);
+      }
+    }
+  } catch (err: any) {
+    console.error('[Cron] Liveness check failed:', err);
+    livenessResults.errors.push(`scan_failed: ${err.message}`);
+  }
+
   res.status(200).json({
     success:   true,
     timestamp: new Date().toISOString(),
@@ -327,6 +372,11 @@ export default async function handler(
       processed: clothesResults.processed.length,
       errors:    clothesResults.errors.length,
       details:   clothesResults,
+    },
+    liveness: {
+      processed: livenessResults.processed.length,
+      errors:    livenessResults.errors.length,
+      details:   livenessResults,
     },
   });
 }

@@ -192,12 +192,14 @@ export async function addUserToQueue(
           { merge: true }
         );
 
-        // Only update nextUserId if this is the first person in queue
+        // Only update nextUserId if this is the first person in queue.
+        // Use set+merge instead of update so it doesn't throw NOT_FOUND
+        // when the Firestore machines doc doesn't exist yet.
         if (users.length === 0) {
-          tx.update(machinesRef.doc(machineId), {
+          tx.set(machinesRef.doc(machineId), {
             nextUserId:  userId,
             lastUpdated: FieldValue.serverTimestamp(),
-          });
+          }, { merge: true });
         }
 
         return newUser;
